@@ -1,0 +1,346 @@
+# este es el código que hasta el momento ha dado mejores resultados
+import pandas as pd
+import numpy as np
+import datetime
+import matplotlib.pyplot as plt
+from matplotlib.pylab import date2num
+import tensorflow as tf
+import seaborn as sns
+import os
+
+############# Importar datos
+lmap=lambda func,it: list(map(lambda x:func(x),it))
+lfilter=lambda func,it: list(filter(lambda x:func(x),it))
+z_score=lambda x:(x-np.mean(x,axis=0))/(np.std(x,axis=0)+1e-5)
+
+
+def import_data(sheet_name,initial_date):
+    asset=pd.read_excel("Datos tesis.xlsx", index_col="Dates", sheet_name=sheet_name)
+    asset["CCI"]=CCI(asset["CLOSE"], 7)
+    asset["RSI"]=relative_strength_index(asset["CLOSE"], 14)
+    asset["ATR"]=ATR(asset["CLOSE"],asset["HIGH"],asset["LOW"], 14)
+    asset["MACD"]=ta.trend.macd(asset["CLOSE"])
+    #asset["STOCH"]=ta.momentum.stoch(asset["HIGH"],asset["LOW"],asset["CLOSE"])
+    asset["UO"]=ta.momentum.uo(asset["HIGH"],asset["LOW"],asset["CLOSE"])
+    #asset["WR"]=ta.momentum.wr(asset["HIGH"],asset["LOW"],asset["CLOSE"])
+    asset["DIFF"]=np.log(asset["CLOSE"])-np.log(asset["CLOSE"].shift(1))
+    asset["lag"]=asset["CLOSE"].shift(1)
+    #asset["lag_2"]=asset["CLOSE"].shift(2)
+    #asset["lag_diff"]=asset["DIFF"].shift(1)
+    #asset["DIFF"]=asset["CLOSE"]/asset["CLOSE"].shift(1)-1
+    asset=asset[initial_date:]
+    return asset
+
+sheet_name="EM Index"
+em_index=import_data(sheet_name,5566)
+sheet_name="REIT Index"
+reit_index=import_data(sheet_name,5566)
+sheet_name="GSCI Index"
+gsci_index=import_data(sheet_name,5566)
+sheet_name="7-10Y US Index"
+bond_index=import_data(sheet_name,5566)
+sheet_name="SPX Index"
+spx_index=import_data(sheet_name,5566)
+
+#data = {'em_index' : em_index}
+data = {'em_index' : em_index, 
+        "reit_index" : reit_index, 
+        'gsci_index' : gsci_index, 
+        'spx_index' : spx_index}
+asset_data = pd.Panel(data)
+
+############# Modelo de DRL con LSTM 
+
+# Direc reinforcement learning
+
+# Lo primero que se hace es definir la clase: 
+# Una clase sirve para definir un objeto al que se va a referir más adelante
+class DRL_Crypto_portfolio(object):
+    def __init__(self, feature_number, action_size=1,c=0.01, hidden_units_number=[128, 64], learning_rate=0.001):
+        
+        
+        tf.reset_default_graph()
+        
+        # En esta linea se definene los parametros a máximizar 
+        #El tf.placeholder sirve para poner los datos de entrada y salida, son los x's y y's, tf.Variable sirve para guardar
+        # los datos es el w_h o el b_h de la regresión tanh(w_h*theta+b_h)
+
+        
+        # Este es el estado del modelo 
+        self.s = tf.placeholder(dtype=tf.float32, shape=[None, feature_number], name='s')
+        # Este es el retorno del activo
+        self.d = tf.placeholder(dtype=tf.float32, shape=[None,action_size-1], name='d')
+        
+        self.s_buffer=[]
+        self.d_buffer=[]
+        self.c=c
+        
+        # Defino el tamaño de la acción 
+        self.action_size=action_size
+        # Asigno un dropout a la red:
+        self.dropout_keep_prob = tf.placeholder(dtype=tf.float32, shape=[], name='dropout_keep_prob')
+        
+        # En este pedazo se define la red:
+        # Primero se hace la primera capa, donde se tienen unos inputs se le efectua una hidden layer 
+        with tf.variable_scope('rnn_encoder', initializer=tf.contrib.layers.xavier_initializer(uniform=True), regularizer=tf.contrib.layers.l2_regularizer(0.01)):
+            # defino los inputs de la red recurrente y los agrego. Adicionalmente, este etapa
+            # tiene un LSTM para evitar el problema de gradient vanishing: 
+            cells=self._add_GRUs(units_number=[128,action_size],activation=[tf.nn.tanh,tf.nn.tanh])
+    
+            # agrego una dimensión de la constante
+            self.rnn_input=tf.expand_dims(self.s,axis=0)
+            # defino el output de esta primera capa y creo la red recurrente: 
+            self.rnn_output,_=tf.nn.dynamic_rnn(inputs=self.rnn_input,cell=cells,dtype=tf.float32)
+            # Empaca los valores: 
+            self.a_prob=tf.unstack(self.rnn_output,axis=0)[0]
+            
+        # en esta segunda parte se realiza una tranformación a los resultados de la hidden layer:
+        with tf.variable_scope('direct_RL',initializer=tf.contrib.layers.xavier_initializer(uniform=True), regularizer=tf.contrib.layers.l2_regularizer(0.01)):
+            # Se le aplica una función softmax a los resultados que arroja a_prob:
+            #self.a_out = tf.nn.tanh(self.a_prob)
+            self.a_out = tf.nn.softmax(self.a_prob,axis=-1)
+            # Concatena el vector generado por la función softmax con un vector de ceros de dimensión 1, action_size.
+            self.a_out = tf.concat((tf.zeros(dtype=tf.float32,shape=[1,self.action_size]), self.a_out), axis=0)
+        
+        with tf.variable_scope('reward'):
+            # Defino la función de ganancias, la rentabilidad la define como:
+            self.reward = tf.reduce_sum(self.d * self.a_out[:-1,:-1] - self.c * tf.abs(self.a_out[1:,:-1] - self.a_out[:-1,:-1]),axis=1)
+            
+            # Rentabilidad total
+            self.total_reward = tf.reduce_sum(self.reward)
+            self.mean_reward = tf.reduce_mean(self.reward)
+
+            self.log_reward_t = tf.log(self.reward)
+            self.sortino = self._sortino_ratio(self.log_reward_t, 0)
+            me,v=self._sharpe_ratio(self.log_reward_t, 0)
+            
+            self.m=me
+            self.v=v
+            self.sharpe=me/v
+            #self.sharpe = self._sharpe_ratio(self.log_reward_t, 0)
+        
+        # Defino el optimizar y la función a optimizar
+        with tf.variable_scope('train'):
+            # Usa un optimizador Adam
+            #optimizer = tf.train.GradientDescentOptimizer(learning_rate=learning_rate)
+            optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate)
+            # Minimiza el promedio de las ganancias acumuladas
+            self.train_op = optimizer.minimize(-self.total_reward)
+            
+        
+        # inicializa la sesión:
+        # Inicializa las variables:
+        self.init_op = tf.global_variables_initializer()
+        self.session = tf.Session()
+        self.saver = tf.train.Saver()
+    
+    # Función para correr el modelo en tensor flow
+    def init_model(self):
+        self.session.run(self.init_op)
+    # agrego las celdas del LSTM y los dropouts
+    def _add_GRU(self,units_number,activation=tf.nn.relu,keep_prob=1.0):
+        cell = tf.contrib.rnn.LSTMCell(units_number,activation=activation)
+        cell = tf.contrib.rnn.DropoutWrapper(cell, input_keep_prob=keep_prob)
+        return cell
+    
+    # Función para agregar las celdas RNN
+    def _add_GRUs(self,units_number,activation,keep_prob=1.0):
+        cells=tf.contrib.rnn.MultiRNNCell(cells=[ self._add_GRU(units_number=n,activation=a) for n,a in zip(units_number,activation)])
+        return cells
+    
+    def _sortino_ratio(self, r, rf):
+        mean, var = tf.nn.moments(r, axes=[0])
+        sign = tf.sign(-tf.sign(r - rf) + 1)
+        number = tf.reduce_sum(sign)
+        lower = sign * r
+        square_sum = tf.reduce_sum(tf.pow(lower, 2))
+        sortino_var = tf.sqrt(square_sum / number)
+        sortino = (mean - rf) / sortino_var
+        return sortino
+    
+    def _sharpe_ratio(self, r, rf):
+        mean, var = tf.nn.moments(r - rf, axes=[0])
+        return mean, var
+
+    # Uso esta parte para correr el código y entrenar la red
+    def train(self, drop=0.85):
+#         np.random.shuffle(random_index)
+        feed = {
+            self.s: np.array(self.s_buffer),
+            self.d: np.array(self.d_buffer),
+            self.dropout_keep_prob: drop
+        }
+        self.session.run([self.train_op], feed_dict=feed)
+    
+    def restore_buffer(self):
+        self.s_buffer = []
+        self.d_buffer = []
+    # Para guardar el estado actual 
+    def save_current_state(self,s,d):
+        self.s_buffer.append(s)
+        self.d_buffer.append(d)
+    
+    # Uso esta parte para correr el código y saber las acciones que hace el agente
+    def trade(self,train=False, drop=1.0, prob=False):
+        feed = {
+            self.s: np.array(self.s_buffer),
+            self.dropout_keep_prob: drop
+        }
+        a_prob = self.session.run([self.a_out], feed_dict=feed)
+        a_prob = a_prob[-1][-1].flatten()
+        return a_prob
+    
+    def load_model(self, model_path='./DRLModel'):
+        self.saver.restore(self.session, model_path + '/model')
+
+    def save_model(self, model_path='./DRLModel'):
+        if not os.path.exists(model_path):
+            os.mkdir(model_path)
+        model_file = model_path + '/model'
+        self.saver.save(self.session, model_file)
+        
+############ Prueba del modelo
+
+# Se definen los parámetros de la prueba
+model=DRL_Crypto_portfolio(action_size=asset_data.shape[0]+1,feature_number=(asset_data.shape[2])*asset_data.shape[0],learning_rate=1e-3)
+#model=DRL_Crypto_portfolio(action_size=2,feature_number=asset_data.shape[1],learning_rate=1e-3)
+print(asset_data.shape[0]+1,asset_data.shape[2]*asset_data.shape[0])
+model.init_model()
+model.restore_buffer()
+
+
+#############  Training y testeo
+
+normalize_length=50
+train_length=1500
+batch_size=10
+c=0.01
+epoch=15
+train_r=[]
+train_mean_r=[]
+test_r=[]
+test_mean_r=[]
+for e in range(epoch):
+    train_reward=[]
+    train_actions=[]
+    test_reward=[]
+    test_actions=[]
+    previous_action=np.zeros(asset_data.shape[0]+1)
+    
+    #state.shape[1] es el largo de la serie, state.shape[2] es el número de columnas
+    for t in range(normalize_length,train_length):
+        ############ Un solo activo:
+        # Defino el estado, que son los datos desde t-normalize:lenght hasta t
+        #state=asset_data[t-normalize_length:t]
+        # Defino el retorno
+        #diff=asset_diff[t-normalize_length:t].iloc[-1]
+        #state=state.values
+        # m: Número de filas, n: número de columnas. state.reshape(m,n)
+        #state=state.reshape((state.shape[0],state.shape[1]))
+        #state=z_score(state)[None,-1]
+        #model.save_current_state(s=state[0],d=diff.values)
+        #action=model.trade(state)
+        #r=np.sum(asset_diff.iloc[t].values*action[:-1]-c*np.sum(np.abs(previous_action-action)))
+        
+        ############ Múltiples activos
+        #data = {'em_index' : em_index.iloc[t-normalize_length:t]}
+        data = {'em_index' : em_index.iloc[t-normalize_length:t], 
+        "reit_index" : reit_index.iloc[t-normalize_length:t], 
+        'gsci_index' : gsci_index.iloc[t-normalize_length:t], 
+        'spx_index' : spx_index.iloc[t-normalize_length:t]}
+        asset_data_test = pd.Panel(data)
+        
+        state=asset_data_test
+        diff=state[:,:,'DIFF'].iloc[-1]
+        #state=asset_data_test[:,:,['OPEN', 'CLOSE', 'HIGH', 'LOW', 'CCI', 'RSI', 'ATR', 'MACD', 'STOCH','UO', 'WR', 'lag']]
+        state=state.values
+        state=state.reshape(state.shape[1],state.shape[0]*state.shape[2])
+        #print("Estados previo"+str( state)+"fin")
+        state=z_score(state)[None,-1]
+        #print("Estados"+str( state)+"fin")
+        model.save_current_state(s=state[0],d=diff.values)
+        action=model.trade(state)
+        #print(action[:-1])
+        #print(asset_data[:,:,'DIFF'].iloc[t].values)
+        r=np.sum(asset_data[:,:,'DIFF'].iloc[t].values*action[:-1]-c*np.sum(np.abs(previous_action-action)))
+        
+        previous_action=action
+        train_reward.append(r)
+        train_actions.append(action)
+        if t % batch_size == 0:
+            model.train(drop=0.8)
+            model.restore_buffer()
+    print(e,'train_reward',"Total="+str(np.sum(train_reward)),"Promedio="+str(np.mean(train_reward)),"sharpe="+str(np.mean(train_reward)/(np.std(train_reward))))
+    train_r.append(np.sum(train_reward))
+    train_mean_r.append(np.mean(train_reward))
+    previous_action=np.zeros(asset_data.shape[0]+1)
+    
+    for t in range(train_length,asset_data.shape[1]):
+        ############ Un solo activo:
+        # Defino el estado, que son los datos desde t-normalize:lenght hasta t
+        #state=asset_data[t-normalize_length:t]
+        # Defino el retorno
+        #diff=asset_diff[t-normalize_length:t].iloc[-1]
+        #state=state.values
+        # m: Número de filas, n: número de columnas. state.reshape(m,n)
+        #state=state.reshape((state.shape[0],state.shape[1]))
+        #state=z_score(state)[None,-1]
+        #model.save_current_state(s=state[0],d=diff.values)
+        #action=model.trade(state)
+        #r=np.sum(asset_diff.iloc[t].values*action[:-1]-c*np.sum(np.abs(previous_action-action)))
+        
+        ############ Múltiples activos
+        #data = {'em_index' : em_index.iloc[t-normalize_length:t]}
+        data = {'em_index' : em_index.iloc[t-normalize_length:t], 
+        "reit_index" : reit_index.iloc[t-normalize_length:t], 
+        'gsci_index' : gsci_index.iloc[t-normalize_length:t], 
+        'spx_index' : spx_index.iloc[t-normalize_length:t]}
+        asset_data_train = pd.Panel(data)
+        
+        state=asset_data_train
+        diff=state[:,:,'DIFF'].iloc[-1]
+        #state=asset_data_train[:,:,['OPEN', 'CLOSE', 'HIGH', 'LOW', 'CCI', 'RSI', 'ATR', 'MACD', 'STOCH','UO', 'WR', 'lag']]
+        state=state.values
+        state=state.reshape(state.shape[1],state.shape[0]*state.shape[2])
+        state=z_score(state)[None,-1]
+        model.save_current_state(s=state[0],d=diff.values)
+        action=model.trade(state)
+        r=np.sum(asset_data[:,:,'DIFF'].iloc[t].values*action[:-1]-c*np.sum(np.abs(previous_action-action)))
+        
+        
+        test_reward.append(r)
+        test_actions.append(action)
+        previous_action=action
+        if t % batch_size==0:
+            model.restore_buffer()
+    print(e,'test_reward',np.sum(test_reward),np.mean(test_reward))
+    test_r.append(np.sum(test_reward))
+    test_mean_r.append(np.mean(test_reward))
+    model.restore_buffer()
+    if np.sum(np.sum(test_reward))>0.3: break
+model.restore_buffer()
+
+############### Resultados preeliminares
+
+plt.plot(train_r)
+plt.plot(test_r)
+###### Gráfico de los activos
+pd.DataFrame(asset_data[:,:,"DIFF"].mean(axis=1).cumsum()).plot()
+pd.DataFrame(asset_data[:,:,"DIFF"].cumsum()).plot()
+
+###### Resultado del entrenamiento
+
+pd.DataFrame(train_reward,index=asset_data[:,:,"DIFF"].iloc[normalize_length:train_length].index,columns=['return']).cumsum().plot()
+asset_data[:,:,"DIFF"].iloc[normalize_length:train_length].mean(axis=1).cumsum().plot()
+
+###### Resultado del testeo
+pd.DataFrame(test_reward,index=asset_data[:,:,"DIFF"].iloc[train_length:].index,columns=['return']).cumsum().plot()
+#(asset_data[:,:,"DIFF"].iloc[train_length:].mean(axis=1).cumsum()*0).plot()
+asset_data[:,:,"DIFF"].iloc[train_length:].mean(axis=1).cumsum().plot()
+#asset_data[:,:,"DIFF"].iloc[train_length:].cumsum().plot()
+
+##### posiciones que toma el robot
+assets_columns=asset_data[:,:,"DIFF"].columns[:]
+test_action_df=pd.DataFrame(test_actions,index=asset_data[:,:,"DIFF"].iloc[train_length:].index,columns=['em_index', 'reit_index', 'gsci_index',"SPX_INDEX"]+['cash'])
+plt.figure(figsize=(15,10))
+sns.heatmap(test_action_df)
