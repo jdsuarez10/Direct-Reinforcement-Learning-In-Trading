@@ -1,0 +1,101 @@
+from pylab import plt
+plt.style.use('seaborn')
+%matplotlib inline
+import cufflinks as cf
+from plotly.offline import download_plotlyjs, init_notebook_mode, plot, iplot
+
+# Pandas
+import pandas as pd
+# Numpy
+import numpy as np
+# Date time
+import datetime as dt
+# Technical analysis
+import ta
+
+# Funciones necesarias
+import numpy as np
+from pyti.simple_moving_average import (
+    simple_moving_average as sma
+    )
+
+def CCI(close_data, period):
+    """
+    Commodity Channel Index.
+    Formula:
+    CCI = (TP - SMA(TP)) / (0.015 * Mean Deviation)
+    """
+    cci = ((close_data - close_data.rolling(window=period).mean()) /(0.015 * close_data.rolling(window=period).std()))
+    return cci
+from __future__ import absolute_import
+import numpy as np
+from pyti import catch_errors
+from pyti.function_helper import fill_for_noncomputable_vals
+from six.moves import range
+from six.moves import zip
+
+
+def relative_strength_index(data, period):
+    """
+    Relative Strength Index.
+    Formula:
+    RSI = 100 - (100 / 1 + (prevGain/prevLoss))
+    """
+    catch_errors.check_for_period_error(data, period)
+
+    period = int(period)
+    changes = [data_tup[1] - data_tup[0] for data_tup in zip(data[::1], data[1::1])]
+
+    filtered_gain = [val < 0 for val in changes]
+    gains = [0 if filtered_gain[idx] is True else changes[idx] for idx in range(0, len(filtered_gain))]
+
+    filtered_loss = [val > 0 for val in changes]
+    losses = [0 if filtered_loss[idx] is True else abs(changes[idx]) for idx in range(0, len(filtered_loss))]
+
+    avg_gain = np.mean(gains[:period])
+    avg_loss = np.mean(losses[:period])
+
+    rsi = []
+    if avg_loss == 0:
+        rsi.append(100)
+    else:
+        rs = avg_gain / avg_loss
+        rsi.append(100 - (100 / (1 + rs)))
+
+    for idx in range(1, len(data) - period):
+        avg_gain = ((avg_gain * (period - 1) +
+                    gains[idx + (period - 1)]) / period)
+        avg_loss = ((avg_loss * (period - 1) +
+                    losses[idx + (period - 1)]) / period)
+
+        if avg_loss == 0:
+            rsi.append(100)
+        else:
+            rs = avg_gain / avg_loss
+            rsi.append(100 - (100 / (1 + rs)))
+
+    rsi = fill_for_noncomputable_vals(data, rsi)
+
+    return rsi
+from __future__ import absolute_import
+import numpy as np
+from pyti.true_range import true_range
+from pyti.smoothed_moving_average import smoothed_moving_average
+from six.moves import range
+
+from pyti.smoothed_moving_average import smoothed_moving_average
+def ATR(close, high,low, period):
+    """
+    True Range.
+    Formula:
+    TRt = MAX(abs(Ht - Lt), abs(Ht - Ct-1), abs(Lt - Ct-1))
+    """
+    rango=[]
+    close=bid=np.array(close)
+    high=np.array(high)
+    low=np.array(low)
+    for i in range(0, len(close)):
+        value =[np.max([high[i] -low[i],abs(high[i] -close[i-1]),abs(low[i] -close[i-1])])]
+        rango=np.append(rango,value)
+    atr = smoothed_moving_average(rango, period)
+    return atr
